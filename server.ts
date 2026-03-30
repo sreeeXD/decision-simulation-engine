@@ -40,24 +40,21 @@ function getOpenAI() {
   return openaiClient;
 }
 
-function getAI() {
-  if (!aiClient) {
-    // Try multiple environment variable names commonly used in AI Studio
-    let apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
-    
-    if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
-      // Fallback to the hardcoded key if the environment variable is missing or is the placeholder
-      apiKey = "";
-    }
-    
-    if (!apiKey) {
-      throw new Error(
-        "Gemini API Key is missing. Please ensure the environment is correctly configured or provide a valid key in the Secrets panel."
-      );
-    }
-    aiClient = new GoogleGenAI({ apiKey });
+function getAI(keyIndex = 0) {
+  // Use primary key first, fallback to secondary if needed
+  const primaryKey = process.env.GEMINI_API_KEY_PRIMARY || process.env.GEMINI_API_KEY || process.env.API_KEY;
+  const secondaryKey = process.env.GEMINI_API_KEY_SECONDARY;
+  
+  let apiKey = keyIndex === 0 ? primaryKey : (secondaryKey || primaryKey);
+  
+  if (!apiKey) {
+    throw new Error(
+      "Gemini API Key is missing. Please ensure the environment is correctly configured or provide a valid key in the Secrets panel."
+    );
   }
-  return aiClient;
+  
+  // Create a new client if the key changes or doesn't exist yet
+  return new GoogleGenAI({ apiKey });
 }
 
 async function callAIWithRetry(params: any, maxRetries = 2) {
@@ -111,49 +108,55 @@ async function callAIWithRetry(params: any, maxRetries = 2) {
     lastError = openaiError;
   }
 
-  // Fallback to Gemini
-  const ai = getAI();
-  const modelsToTry = [params.model, "gemini-3.1-flash-lite-preview", "gemini-flash-latest"];
+  // Fallback to Gemini with lighter models if primary limits are reached
+  const modelsToTry = [params.model, "gemini-3.1-flash-lite-preview", "gemini-1.5-flash", "gemini-1.5-flash-8b"];
   
-  for (const modelName of modelsToTry) {
-    if (!modelName) continue;
+  for (let keyIndex = 0; keyIndex < 2; keyIndex++) {
+    let ai;
+    try {
+      ai = getAI(keyIndex);
+    } catch (e) {
+      if (keyIndex === 1) break; // No secondary key available
+      throw e;
+    }
     
-    for (let i = 0; i < maxRetries; i++) {
-      try {
-        const response = await ai.models.generateContent({
-          ...params,
-          model: modelName
-        });
-        return response;
-      } catch (error: any) {
-        lastError = error;
-        
-        // Extract error details for better detection
-        const errorMessage = error.message || "";
-        const errorStatus = error.status || (error.response ? error.response.status : null);
-        const errorBody = error.response ? JSON.stringify(error.response) : "";
-        
-        const isRetryable = 
-          errorStatus === 503 || 
-          errorStatus === 429 || 
-          errorMessage.includes("503") || 
-          errorMessage.includes("429") || 
-          errorMessage.includes("high demand") ||
-          errorMessage.includes("UNAVAILABLE") ||
-          errorBody.includes("503") ||
-          errorBody.includes("high demand");
+    for (const modelName of modelsToTry) {
+      if (!modelName) continue;
+      
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          const response = await ai.models.generateContent({
+            ...params,
+            model: modelName
+          });
+          return response;
+        } catch (error: any) {
+          lastError = error;
+          
+          const errorMessage = error.message || "";
+          const errorStatus = error.status || (error.response ? error.response.status : null);
+          const errorBody = error.response ? JSON.stringify(error.response) : "";
+          
+          const isRetryable = 
+            errorStatus === 503 || 
+            errorStatus === 429 || 
+            errorMessage.includes("503") || 
+            errorMessage.includes("429") || 
+            errorMessage.includes("high demand") ||
+            errorMessage.includes("UNAVAILABLE") ||
+            errorBody.includes("503") ||
+            errorBody.includes("high demand");
 
-        if (isRetryable && i < maxRetries - 1) {
-          // Faster backoff for fallback: 500ms, 1s
-          const delay = (i + 1) * 500 + Math.random() * 500;
-          console.log(`Gemini (${modelName}) busy or rate limited (${errorStatus}). Retrying in ${Math.round(delay)}ms... (Attempt ${i + 1}/${maxRetries})`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          continue;
+          if (isRetryable && i < maxRetries - 1) {
+            const delay = (i + 1) * 500 + Math.random() * 500;
+            console.log(`Gemini (${modelName}) key ${keyIndex + 1} busy or rate limited (${errorStatus}). Retrying in ${Math.round(delay)}ms... (Attempt ${i + 1}/${maxRetries})`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            continue;
+          }
+          
+          console.warn(`Gemini model ${modelName} key ${keyIndex + 1} failed with error: ${errorMessage} (Status: ${errorStatus}). Trying next model or key...`);
+          break; 
         }
-        
-        // If not retryable or max retries reached for THIS model, break to try NEXT model
-        console.warn(`Gemini model ${modelName} failed with error: ${errorMessage} (Status: ${errorStatus}). Trying next model...`);
-        break; 
       }
     }
   }
